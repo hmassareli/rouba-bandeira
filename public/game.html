@@ -40,7 +40,7 @@
       let isFrozen = false;
       const FREEZE_DURATION = 5000;
       const RETURN_DURATION = 1000;
-      const VICTORY_DELAY = 3000; // 3 segundos para mostrar a mensagem de vitória
+      const VICTORY_DELAY = 3000;
       let victoryMessage = null;
       let victoryTime = null;
 
@@ -82,7 +82,7 @@
             freezeStart: null,
             returnStart: null,
             returnTarget: null,
-            velocityX: 0, // Novo: para aceleração
+            velocityX: 0,
             velocityY: 0,
           };
 
@@ -121,6 +121,7 @@
             respawnAll();
           }, VICTORY_DELAY);
         } else if (data.type === "playerLeft") {
+          console.log(`Jogador ${data.playerId} saiu, removendo do estado`);
           delete gameState.players[data.playerId];
         }
       };
@@ -262,12 +263,14 @@
 
         Object.keys(newState.players).forEach((id) => {
           if (id === myId) {
-            gameState.players[id].frozen = newState.players[id].frozen;
-            gameState.players[id].ts = newState.players[id].ts;
-            if (
-              newState.players[id].frozen &&
-              !gameState.players[id].freezeStart
-            ) {
+            const newPlayer = newState.players[id];
+            gameState.players[id].frozen = newPlayer.frozen;
+            gameState.players[id].ts = newPlayer.ts;
+            gameState.players[id].holdingFlag = newPlayer.holdingFlag;
+            if (newPlayer.frozen && !gameState.players[id].freezeStart) {
+              console.log(
+                `Jogador ${myId} congelado em x:${position.x}, y:${position.y}`
+              );
               gameState.players[id].freezeStart = Date.now();
               gameState.players[id].returnTarget = {
                 x: initialPlayerPositions[myTeam].x,
@@ -306,34 +309,46 @@
           flag.ts = Date.now();
           gameState.players[myId].holdingFlag =
             myTeam === "blue" ? "red" : "blue";
+          console.log(
+            `Jogador ${myId} capturou a bandeira ${gameState.players[myId].holdingFlag}`
+          );
           sendGameState();
         }
       }
 
       function checkFreeze() {
         Object.entries(gameState.players).forEach(([id, player]) => {
-          if (id !== myId && player.team !== myTeam && !player.frozen) {
-            const inMyZone =
-              myTeam === "blue" ? player.x < 400 : player.x > 400;
-            const distance = Math.sqrt(
-              (position.x - player.x) ** 2 + (position.y - player.y) ** 2
+          // Verifica se player existe e é válido
+          if (!player || id === myId || player.team === myTeam || player.frozen)
+            return;
+
+          const inMyZone = myTeam === "blue" ? player.x < 400 : player.x > 400;
+          const distance = Math.sqrt(
+            (position.x - player.x) ** 2 + (position.y - player.y) ** 2
+          );
+
+          if (inMyZone && distance < 50) {
+            console.log(
+              `Congelando jogador ${id} em x:${player.x}, y:${player.y}`
             );
-            if (inMyZone && distance < 50) {
-              player.frozen = true;
-              player.freezeStart = Date.now();
-              player.returnTarget = initialPlayerPositions[player.team];
-              if (player.holdingFlag) {
-                const flagName = player.holdingFlag;
-                const flag =
-                  flagName === "blue" ? gameState.blueFlag : gameState.redFlag;
-                flag.holder = null;
-                flag.x = initialFlagPositions[flagName].x;
-                flag.y = initialFlagPositions[flagName].y;
-                flag.ts = Date.now();
-                player.holdingFlag = null;
-              }
-              sendGameState();
+            player.frozen = true;
+            player.freezeStart = Date.now();
+            player.returnTarget = initialPlayerPositions[player.team];
+
+            if (player.holdingFlag) {
+              const flagName = player.holdingFlag;
+              const flag =
+                flagName === "blue" ? gameState.blueFlag : gameState.redFlag;
+              console.log(`Jogador ${id} soltou a bandeira ${flagName}`);
+              flag.holder = null;
+              flag.x = initialFlagPositions[flagName].x;
+              flag.y = initialFlagPositions[flagName].y;
+              flag.ts = Date.now();
+              player.holdingFlag = null;
             }
+
+            gameState.players[id].ts = Date.now();
+            sendGameState();
           }
         });
       }
@@ -388,16 +403,16 @@
           if (id === myId) {
             position.x = spawn.x;
             position.y = spawn.y;
+            isFrozen = false;
           }
         });
-        isFrozen = false;
         sendGameState();
         drawGame();
       }
 
-      const ACCELERATION = 0.5; // Aceleração por frame
-      const MAX_SPEED = 5; // Velocidade máxima
-      const FRICTION = 0.9; // Reduz a velocidade gradualmente
+      const ACCELERATION = 0.5;
+      const MAX_SPEED = 5;
+      const FRICTION = 0.9;
       let direction = { x: 0, y: 0 };
 
       document.addEventListener("keydown", (e) => {
@@ -445,7 +460,6 @@
             }
           }
         } else if (!inputDisabled) {
-          // Normalizar direção para evitar velocidade extra na diagonal
           const magnitude = Math.sqrt(direction.x ** 2 + direction.y ** 2);
           const normalizedDir =
             magnitude > 0
@@ -455,11 +469,9 @@
                 }
               : { x: 0, y: 0 };
 
-          // Aplicar aceleração
           player.velocityX += normalizedDir.x * ACCELERATION;
           player.velocityY += normalizedDir.y * ACCELERATION;
 
-          // Limitar velocidade máxima
           const speed = Math.sqrt(
             player.velocityX ** 2 + player.velocityY ** 2
           );
@@ -469,11 +481,9 @@
             player.velocityY *= scale;
           }
 
-          // Aplicar atrito
           player.velocityX *= FRICTION;
           player.velocityY *= FRICTION;
 
-          // Atualizar posição
           position.x = Math.max(
             0,
             Math.min(800, position.x + player.velocityX)

@@ -2,10 +2,10 @@ const http = require("http");
 const WebSocket = require("ws");
 const express = require("express");
 const path = require("path");
-const ngrok = require("ngrok"); // Certifique-se de instalar com: npm install ngrok
+const ngrok = require("ngrok");
 
 const app = express();
-app.use(express.static(path.join(__dirname, "public"))); // Serve arquivos da pasta 'public'
+app.use(express.static(path.join(__dirname, "public")));
 
 const server = http.createServer(app);
 const wss = new WebSocket.Server({ server });
@@ -45,6 +45,9 @@ wss.on("connection", (ws) => {
         .get(data.targetId)
         .ws.send(JSON.stringify({ ...data, fromId: playerId }));
     }
+    if (data.type === "victory") {
+      players.forEach((p) => p.ws.send(JSON.stringify(data)));
+    }
   });
 
   ws.on("close", () => {
@@ -54,22 +57,22 @@ wss.on("connection", (ws) => {
     players.forEach((p) =>
       p.ws.send(
         JSON.stringify({
-          type: "init",
-          players: Array.from(players.keys()),
+          type: "playerLeft",
+          playerId,
           blueLeader,
           redLeader,
         })
       )
     );
-    console.log("Conexão fechada");
+    console.log(`Jogador ${playerId} saiu`);
   });
 });
 
 server.listen(3000, async () => {
   console.log("Servidor local rodando na porta 3000");
   try {
-    await ngrok.authtoken("2FPRDtrxApO70jHRGL6jfuksWBO_3687cs2NXz17VHREC2vMG");
-    const url = await ngrok.connect(3000); // Abre o túnel ngrok na porta 3000
+    await ngrok.authtoken("2FPRDtrxApO70jHRGL6jfuksWBO_3687cs2NXz17VHREC2vMG"); // Substitua pelo seu token ngrok
+    const url = await ngrok.connect(3000);
     console.log(`Túnel ngrok criado! Acesse em: ${url}`);
     console.log(`Dê este link pros seus amigos: ${url}/game.html`);
   } catch (err) {
