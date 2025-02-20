@@ -1,0 +1,600 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <title>Rouba Bandeira com Líderes</title>
+  </head>
+  <body>
+    <h1>Rouba Bandeira</h1>
+    <canvas
+      id="gameCanvas"
+      width="800"
+      height="600"
+      style="border: 1px solid black"
+    ></canvas>
+    <div id="status"></div>
+    <script>
+      // Configurações iniciais
+      const initialFlagPositions = {
+        blueFlag: { x: 100, y: 300 },
+        redFlag: { x: 700, y: 300 },
+      };
+      const initialPlayerPositions = {
+        blue: { x: 100, y: 300 },
+        red: { x: 700, y: 300 },
+      };
+
+      let inputDisabled = false;
+      const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
+      const wsUrl = `${protocol}//${window.location.host}`;
+      console.log("Conectando ao WebSocket em:", wsUrl);
+      const ws = new WebSocket(wsUrl);
+      const peers = {};
+      const config = { iceServers: [{ urls: "stun:stun.l.google.com:19302" }] };
+
+      let myId, myTeam, leaderId, isLeader, blueLeader, redLeader;
+      const canvas = document.getElementById("gameCanvas");
+      const ctx = canvas.getContext("2d");
+      const statusDiv = document.getElementById("status");
+
+      let position = { x: 0, y: 0 };
+      let isFrozen = false;
+      const FREEZE_DURATION = 5000;
+      const RETURN_DURATION = 1000;
+      const VICTORY_DELAY = 3000; // 3 segundos para mostrar a mensagem de vitória
+      let victoryMessage = null;
+      let victoryTime = null;
+
+      const gameState = {
+        blueFlag: {
+          ...initialFlagPositions.blueFlag,
+          holder: null,
+          ts: Date.now(),
+        },
+        redFlag: {
+          ...initialFlagPositions.redFlag,
+          holder: null,
+          ts: Date.now(),
+        },
+        players: {},
+      };
+      let lastSentState = 0;
+
+      ws.onopen = () => console.log("WebSocket conectado!");
+
+      ws.onmessage = (event) => {
+        const data = JSON.parse(event.data);
+        if (data.type === "init") {
+          myId = data.playerId;
+          myTeam = data.team;
+          leaderId = data.leaderId;
+          isLeader = data.isLeader;
+          blueLeader = data.blueLeader;
+          redLeader = data.redLeader;
+          position.x = initialPlayerPositions[myTeam].x;
+          position.y = initialPlayerPositions[myTeam].y;
+          gameState.players[myId] = {
+            x: position.x,
+            y: position.y,
+            team: myTeam,
+            frozen: false,
+            holdingFlag: null,
+            ts: Date.now(),
+            freezeStart: null,
+            returnStart: null,
+            returnTarget: null,
+            velocityX: 0, // Novo: para aceleração
+            velocityY: 0,
+          };
+
+          if (leaderId) connectToPeer(leaderId);
+          if (isLeader && myTeam === "blue" && redLeader)
+            connectToPeer(redLeader);
+          if (isLeader && myTeam === "red" && blueLeader)
+            connectToPeer(blueLeader);
+
+          drawGame();
+          requestAnimationFrame(gameLoop);
+        } else if (data.type === "error") {
+          alert(data.message);
+          ws.close();
+        } else if (data.offer) {
+          handleOffer(data.offer, data.fromId);
+        } else if (data.answer) {
+          peers[data.fromId].peerConnection.setRemoteDescription(
+            new RTCSessionDescription(data.answer)
+          );
+        } else if (data.candidate) {
+          peers[data.fromId].peerConnection.addIceCandidate(
+            new RTCIceCandidate(data.candidate)
+          );
+        } else if (data.type === "gameState") {
+          updateGameState(data.state);
+        } else if (data.type === "victory") {
+          victoryMessage = `${
+            data.team === "blue" ? "Time Azul" : "Time Vermelho"
+          } venceu!`;
+          victoryTime = Date.now();
+          inputDisabled = true;
+          setTimeout(() => {
+            victoryMessage = null;
+            inputDisabled = false;
+            respawnAll();
+          }, VICTORY_DELAY);
+        } else if (data.type === "playerLeft") {
+          delete gameState.players[data.playerId];
+        }
+      };
+
+      ws.onerror = (error) => console.error("Erro no WebSocket:", error);
+      ws.onclose = () => console.log("WebSocket fechado");
+
+      function connectToPeer(targetId) {
+        if (peers[targetId]) return;
+        const peerConnection = new RTCPeerConnection(config);
+        const dataChannel = peerConnection.createDataChannel("game");
+        peers[targetId] = { peerConnection, dataChannel };
+
+        dataChannel.onopen = () => {
+          console.log(`Conectado a ${targetId}`);
+          sendGameState();
+        };
+        dataChannel.onmessage = (event) => {
+          const msg = JSON.parse(event.data);
+          if (msg.type === "gameState") updateGameState(msg.state);
+          if (msg.type === "victory") {
+            victoryMessage = `${
+              msg.team === "blue" ? "Time Azul" : "Time Vermelho"
+            } venceu!`;
+            victoryTime = Date.now();
+            inputDisabled = true;
+            setTimeout(() => {
+              victoryMessage = null;
+              inputDisabled = false;
+              respawnAll();
+            }, VICTORY_DELAY);
+          }
+        };
+
+        peerConnection.onicecandidate = (event) => {
+          if (event.candidate)
+            ws.send(JSON.stringify({ candidate: event.candidate, targetId }));
+        };
+
+        peerConnection
+          .createOffer()
+          .then((offer) => peerConnection.setLocalDescription(offer))
+          .then(() =>
+            ws.send(
+              JSON.stringify({
+                offer: peerConnection.localDescription,
+                targetId,
+              })
+            )
+          );
+      }
+
+      async function handleOffer(offer, fromId) {
+        if (peers[fromId]) return;
+        const peerConnection = new RTCPeerConnection(config);
+        peers[fromId] = { peerConnection };
+
+        peerConnection.ondatachannel = (event) => {
+          peers[fromId].dataChannel = event.channel;
+          peers[fromId].dataChannel.onopen = () => {
+            console.log(`Conectado a ${fromId}`);
+            sendGameState();
+          };
+          peers[fromId].dataChannel.onmessage = (event) => {
+            const msg = JSON.parse(event.data);
+            if (msg.type === "gameState") updateGameState(msg.state);
+            if (msg.type === "victory") {
+              victoryMessage = `${
+                msg.team === "blue" ? "Time Azul" : "Time Vermelho"
+              } venceu!`;
+              victoryTime = Date.now();
+              inputDisabled = true;
+              setTimeout(() => {
+                victoryMessage = null;
+                inputDisabled = false;
+                respawnAll();
+              }, VICTORY_DELAY);
+            }
+          };
+        };
+
+        await peerConnection.setRemoteDescription(
+          new RTCSessionDescription(offer)
+        );
+        const answer = await peerConnection.createAnswer();
+        await peerConnection.setLocalDescription(answer);
+        ws.send(
+          JSON.stringify({
+            answer: peerConnection.localDescription,
+            targetId: fromId,
+          })
+        );
+
+        peerConnection.onicecandidate = (event) => {
+          if (event.candidate)
+            ws.send(
+              JSON.stringify({ candidate: event.candidate, targetId: fromId })
+            );
+        };
+      }
+
+      function sendGameState() {
+        const now = Date.now();
+        if (now - lastSentState < 50) return;
+        lastSentState = now;
+        if (gameState.players[myId]) gameState.players[myId].ts = now;
+        const state = { type: "gameState", state: gameState };
+        Object.values(peers).forEach((peer) => {
+          if (peer.dataChannel && peer.dataChannel.readyState === "open") {
+            peer.dataChannel.send(JSON.stringify(state));
+          }
+        });
+      }
+
+      function sendVictory(team) {
+        const message = { type: "victory", team };
+        ws.send(JSON.stringify(message));
+        Object.values(peers).forEach((peer) => {
+          if (peer.dataChannel && peer.dataChannel.readyState === "open") {
+            peer.dataChannel.send(JSON.stringify(message));
+          }
+        });
+      }
+
+      function updateGameState(newState) {
+        if (
+          newState.blueFlag &&
+          (!gameState.blueFlag.ts ||
+            newState.blueFlag.ts > gameState.blueFlag.ts)
+        ) {
+          gameState.blueFlag = { ...newState.blueFlag };
+        }
+        if (
+          newState.redFlag &&
+          (!gameState.redFlag.ts || newState.redFlag.ts > gameState.redFlag.ts)
+        ) {
+          gameState.redFlag = { ...newState.redFlag };
+        }
+
+        Object.keys(newState.players).forEach((id) => {
+          if (id === myId) {
+            gameState.players[id].frozen = newState.players[id].frozen;
+            gameState.players[id].ts = newState.players[id].ts;
+            if (
+              newState.players[id].frozen &&
+              !gameState.players[id].freezeStart
+            ) {
+              gameState.players[id].freezeStart = Date.now();
+              gameState.players[id].returnTarget = {
+                x: initialPlayerPositions[myTeam].x,
+                y: initialPlayerPositions[myTeam].y,
+              };
+              isFrozen = true;
+            }
+          } else {
+            if (!gameState.players[id]) {
+              gameState.players[id] = {
+                ...newState.players[id],
+                targetX: newState.players[id].x,
+                targetY: newState.players[id].y,
+              };
+            } else if (
+              !gameState.players[id].ts ||
+              newState.players[id].ts > gameState.players[id].ts
+            ) {
+              gameState.players[id] = { ...newState.players[id] };
+              gameState.players[id].targetX = newState.players[id].x;
+              gameState.players[id].targetY = newState.players[id].y;
+            }
+          }
+        });
+        drawGame();
+      }
+
+      function checkFlagCapture() {
+        const flag = myTeam === "blue" ? gameState.redFlag : gameState.blueFlag;
+        if (
+          !flag.holder &&
+          Math.abs(position.x - flag.x) < 20 &&
+          Math.abs(position.y - flag.y) < 20
+        ) {
+          flag.holder = myId;
+          flag.ts = Date.now();
+          gameState.players[myId].holdingFlag =
+            myTeam === "blue" ? "red" : "blue";
+          sendGameState();
+        }
+      }
+
+      function checkFreeze() {
+        Object.entries(gameState.players).forEach(([id, player]) => {
+          if (id !== myId && player.team !== myTeam && !player.frozen) {
+            const inMyZone =
+              myTeam === "blue" ? player.x < 400 : player.x > 400;
+            const distance = Math.sqrt(
+              (position.x - player.x) ** 2 + (position.y - player.y) ** 2
+            );
+            if (inMyZone && distance < 50) {
+              player.frozen = true;
+              player.freezeStart = Date.now();
+              player.returnTarget = initialPlayerPositions[player.team];
+              if (player.holdingFlag) {
+                const flagName = player.holdingFlag;
+                const flag =
+                  flagName === "blue" ? gameState.blueFlag : gameState.redFlag;
+                flag.holder = null;
+                flag.x = initialFlagPositions[flagName].x;
+                flag.y = initialFlagPositions[flagName].y;
+                flag.ts = Date.now();
+                player.holdingFlag = null;
+              }
+              sendGameState();
+            }
+          }
+        });
+      }
+
+      function checkVictory() {
+        const enemyFlag =
+          myTeam === "blue" ? gameState.redFlag : gameState.blueFlag;
+        if (
+          enemyFlag.holder === myId &&
+          ((myTeam === "blue" && position.x < 400) ||
+            (myTeam === "red" && position.x > 400))
+        ) {
+          sendVictory(myTeam);
+          victoryMessage = `${
+            myTeam === "blue" ? "Time Azul" : "Time Vermelho"
+          } venceu!`;
+          victoryTime = Date.now();
+          inputDisabled = true;
+          setTimeout(() => {
+            victoryMessage = null;
+            inputDisabled = false;
+            respawnAll();
+          }, VICTORY_DELAY);
+        }
+      }
+
+      function respawnAll() {
+        gameState.blueFlag = {
+          ...initialFlagPositions.blueFlag,
+          holder: null,
+          ts: Date.now(),
+        };
+        gameState.redFlag = {
+          ...initialFlagPositions.redFlag,
+          holder: null,
+          ts: Date.now(),
+        };
+
+        Object.keys(gameState.players).forEach((id) => {
+          const team = gameState.players[id].team;
+          const spawn = initialPlayerPositions[team];
+          gameState.players[id].x = spawn.x;
+          gameState.players[id].y = spawn.y;
+          gameState.players[id].frozen = false;
+          gameState.players[id].holdingFlag = null;
+          gameState.players[id].freezeStart = null;
+          gameState.players[id].returnStart = null;
+          gameState.players[id].returnTarget = null;
+          gameState.players[id].velocityX = 0;
+          gameState.players[id].velocityY = 0;
+          gameState.players[id].ts = Date.now();
+          if (id === myId) {
+            position.x = spawn.x;
+            position.y = spawn.y;
+          }
+        });
+        isFrozen = false;
+        sendGameState();
+        drawGame();
+      }
+
+      const ACCELERATION = 0.5; // Aceleração por frame
+      const MAX_SPEED = 5; // Velocidade máxima
+      const FRICTION = 0.9; // Reduz a velocidade gradualmente
+      let direction = { x: 0, y: 0 };
+
+      document.addEventListener("keydown", (e) => {
+        if (inputDisabled || isFrozen) return;
+        if (e.key === "ArrowUp") direction.y = -1;
+        if (e.key === "ArrowDown") direction.y = 1;
+        if (e.key === "ArrowLeft") direction.x = -1;
+        if (e.key === "ArrowRight") direction.x = 1;
+      });
+
+      document.addEventListener("keyup", (e) => {
+        if (e.key === "ArrowUp" || e.key === "ArrowDown") direction.y = 0;
+        if (e.key === "ArrowLeft" || e.key === "ArrowRight") direction.x = 0;
+      });
+
+      function gameLoop() {
+        if (!myId || !gameState.players[myId]) return;
+
+        const player = gameState.players[myId];
+        if (player.frozen) {
+          const now = Date.now();
+          const freezeElapsed = now - player.freezeStart;
+
+          if (freezeElapsed >= FREEZE_DURATION && !player.returnStart) {
+            player.returnStart = now;
+          }
+
+          if (player.returnStart) {
+            const returnElapsed = now - player.returnStart;
+            const returnProgress = Math.min(returnElapsed / RETURN_DURATION, 1);
+            position.x =
+              player.x + (player.returnTarget.x - player.x) * returnProgress;
+            position.y =
+              player.y + (player.returnTarget.y - player.y) * returnProgress;
+            gameState.players[myId].x = position.x;
+            gameState.players[myId].y = position.y;
+
+            if (returnProgress >= 1) {
+              player.frozen = false;
+              player.freezeStart = null;
+              player.returnStart = null;
+              player.returnTarget = null;
+              isFrozen = false;
+              sendGameState();
+            }
+          }
+        } else if (!inputDisabled) {
+          // Normalizar direção para evitar velocidade extra na diagonal
+          const magnitude = Math.sqrt(direction.x ** 2 + direction.y ** 2);
+          const normalizedDir =
+            magnitude > 0
+              ? {
+                  x: direction.x / magnitude,
+                  y: direction.y / magnitude,
+                }
+              : { x: 0, y: 0 };
+
+          // Aplicar aceleração
+          player.velocityX += normalizedDir.x * ACCELERATION;
+          player.velocityY += normalizedDir.y * ACCELERATION;
+
+          // Limitar velocidade máxima
+          const speed = Math.sqrt(
+            player.velocityX ** 2 + player.velocityY ** 2
+          );
+          if (speed > MAX_SPEED) {
+            const scale = MAX_SPEED / speed;
+            player.velocityX *= scale;
+            player.velocityY *= scale;
+          }
+
+          // Aplicar atrito
+          player.velocityX *= FRICTION;
+          player.velocityY *= FRICTION;
+
+          // Atualizar posição
+          position.x = Math.max(
+            0,
+            Math.min(800, position.x + player.velocityX)
+          );
+          position.y = Math.max(
+            0,
+            Math.min(600, position.y + player.velocityY)
+          );
+          gameState.players[myId].x = position.x;
+          gameState.players[myId].y = position.y;
+        }
+
+        Object.keys(gameState.players).forEach((id) => {
+          if (id !== myId && gameState.players[id].targetX !== undefined) {
+            const p = gameState.players[id];
+            if (p.frozen && p.freezeStart) {
+              const now = Date.now();
+              const freezeElapsed = now - p.freezeStart;
+              if (freezeElapsed >= FREEZE_DURATION && !p.returnStart)
+                p.returnStart = now;
+              if (p.returnStart) {
+                const returnElapsed = now - p.returnStart;
+                const returnProgress = Math.min(
+                  returnElapsed / RETURN_DURATION,
+                  1
+                );
+                p.x = p.x + (p.returnTarget.x - p.x) * returnProgress;
+                p.y = p.y + (p.returnTarget.y - p.y) * returnProgress;
+                if (returnProgress >= 1) {
+                  p.frozen = false;
+                  p.freezeStart = null;
+                  p.returnStart = null;
+                  p.returnTarget = null;
+                }
+              }
+            } else {
+              p.x += (p.targetX - p.x) * 0.2;
+              p.y += (p.targetY - p.y) * 0.2;
+            }
+          }
+        });
+
+        checkFlagCapture();
+        checkFreeze();
+        checkVictory();
+        sendGameState();
+        drawGame();
+        requestAnimationFrame(gameLoop);
+      }
+
+      function interpolateColor(startColor, endColor, progress) {
+        const r = Math.round(
+          startColor.r + (endColor.r - startColor.r) * progress
+        );
+        const g = Math.round(
+          startColor.g + (endColor.g - startColor.g) * progress
+        );
+        const b = Math.round(
+          startColor.b + (endColor.b - startColor.b) * progress
+        );
+        return `rgb(${r}, ${g}, ${b})`;
+      }
+
+      function drawGame() {
+        ctx.clearRect(0, 0, 800, 600);
+        ctx.fillStyle = "lightblue";
+        ctx.fillRect(0, 0, 400, 600);
+        ctx.fillStyle = "pink";
+        ctx.fillRect(400, 0, 400, 600);
+
+        if (!gameState.blueFlag.holder) {
+          ctx.fillStyle = "blue";
+          ctx.fillRect(gameState.blueFlag.x, gameState.blueFlag.y, 10, 20);
+        }
+        if (!gameState.redFlag.holder) {
+          ctx.fillStyle = "red";
+          ctx.fillRect(gameState.redFlag.x, gameState.redFlag.y, 10, 20);
+        }
+
+        Object.entries(gameState.players).forEach(([id, player]) => {
+          if (player.frozen && player.freezeStart) {
+            const now = Date.now();
+            const freezeElapsed = now - player.freezeStart;
+            const freezeProgress = Math.min(freezeElapsed / FREEZE_DURATION, 1);
+            const startColor = { r: 128, g: 128, b: 128 };
+            const endColor =
+              player.team === "blue"
+                ? { r: 0, g: 0, b: 255 }
+                : { r: 255, g: 0, b: 0 };
+            ctx.fillStyle = interpolateColor(
+              startColor,
+              endColor,
+              freezeProgress
+            );
+          } else {
+            ctx.fillStyle = player.team === "blue" ? "blue" : "red";
+          }
+          ctx.fillRect(player.x, player.y, 20, 20);
+          if (player.frozen) {
+            ctx.strokeStyle = "black";
+            ctx.strokeRect(player.x, player.y, 20, 20);
+          }
+          if (player.holdingFlag) {
+            ctx.fillStyle = player.holdingFlag === "blue" ? "blue" : "red";
+            ctx.fillRect(player.x + 5, player.y - 10, 5, 10);
+          }
+        });
+
+        if (victoryMessage) {
+          ctx.fillStyle = "rgba(0, 0, 0, 0.7)";
+          ctx.fillRect(200, 250, 400, 100);
+          ctx.fillStyle = "white";
+          ctx.font = "30px Arial";
+          ctx.textAlign = "center";
+          ctx.fillText(victoryMessage, 400, 310);
+        }
+
+        statusDiv.textContent = `Time: ${myTeam || "Aguardando"} | Líder: ${
+          isLeader ? "Sim" : "Não"
+        } | Congelado: ${isFrozen}`;
+      }
+    </script>
+  </body>
+</html>
